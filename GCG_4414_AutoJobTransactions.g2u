@@ -1,0 +1,620 @@
+Program.Sub.Preflight.Start
+V.Global.iFileHandle.Declare(Long)
+Program.Sub.Preflight.End
+
+Program.Sub.Main.Start
+F.Intrinsic.Control.Try
+	V.Local.sFile.Declare(String)
+	
+	F.ODBC.Connection!con.OpenConnection(V.Ambient.PDSN, V.Ambient.PUser, V.Ambient.PPass)
+	
+	F.Intrinsic.Control.SelectCase(V.Caller.Hook)
+		'Hook 38130 is for the post online update process. We need to set this up as Asynchronus
+		F.Intrinsic.Control.Case("38130")
+			'GCG_4414_AutoTransactionsReport.txt is used to make sure this process is not run on top of itself.
+			F.Intrinsic.String.Build("{0}\GCG_4414_AutoTransactionsReport.txt", V.Caller.FilesDir, V.Local.sFile)
+			F.Intrinsic.Control.CallSub(PerformLockCheck,"sFileFQN",V.Local.sFile,"sMessage", "Automated Job Transactions project in process via Online Update. This will be automatically deleted when process is complete. Do not delete manually.")
+			
+			'We will be grabbing data that has not yet been reported from the custom tables to check what lines were processed correctly. We will generate a report with this data
+			F.Intrinsic.Control.CallSub(GatherData)
+			F.Intrinsic.Control.CallSub(CreateReport)
+			
+			F.Intrinsic.Control.CallSub(RemoveLockFile,V.Local.sFile)
+			
+		'If it is not in the online update hook, it must be the custom menu item, which will grab all the data in the custom tables with the process flag set to N for new
+		F.Intrinsic.Control.CaseElse
+			'GCG_4414_AutoTransactions.txt is used to make sure this process is not run on top of itself.
+			F.Intrinsic.String.Build("{0}\GCG_4414_AutoTransactions.txt",V.Caller.FilesDir,V.Local.sFile)
+			F.Intrinsic.Control.CallSub(PerformLockCheck,"sFileFQN",V.Local.sFile,"sMessage","Automated Job Transactions project in process via Scheduled Task. This will be automatically deleted when process is complete. Do not delete manually.")
+			
+			F.Intrinsic.UI.InvokeWaitDialog("Automated Job Transactions in Progress", "Automated Transactions")
+			F.Intrinsic.Control.CallSub(JobRecordsTransactions)
+			F.Intrinsic.Control.CallSub(Backflush)
+			F.Intrinsic.Control.CallSub(WIPToFGTransactions)
+			
+			F.Intrinsic.Control.CallSub(RemoveLockFile,V.Local.sFile)
+			
+	F.Intrinsic.Control.EndSelect
+	
+	F.Intrinsic.Control.CallSub(Unload)
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.CallSub(CatchError, "Sub", V.Ambient.CurrentSubroutine, "Error", V.Ambient.ErrorNumber, "ErrorDescription", V.Ambient.ErrorDescription)
+F.Intrinsic.Control.EndTry
+Program.Sub.Main.End
+
+Program.Sub.GatherData.Start
+F.Intrinsic.Control.Try
+	V.Local.sSQL.Declare(String)
+	V.Local.sFilter.Declare(String)
+	V.Local.sSeqKey.Declare(String)
+	V.Local.sFile.Declare(String)
+	V.Local.iJobRecordsRow.Declare(Long)
+	V.Local.dCharge.Declare(Date)
+	
+	'The success of the WIP to FG transactions will already be determined at this point
+	F.Data.DataTable.CreateFromSQL("WIPSuccess", "con", "SELECT * FROM GCG_4414_WIPFG_IMP WHERE Process_Flag = 'S'",True)
+	F.Data.DataTable.CreateFromSQL("WIPFail", "con", "SELECT * FROM GCG_4414_WIPFG_IMP WHERE Process_Flag = 'F'", True)
+	
+	'We need to check to see if the records were processed. The program used to process them runs from the Online
+	F.Data.DataTable.CreateFromSQL("JobRecords", "con", "SELECT * FROM GCG_4414_Job_Imports WHERE Process_Flag = 'W'",True)
+	
+	'Reset the Custom Table Info. Place 'P' for processed in all data being processed
+	F.ODBC.Connection!con.Execute("UPDATE GCG_4414_WIPFG_IMP SET Process_Flag = 'D' WHERE Process_Flag IN ('S', 'F')")
+	
+	F.Intrinsic.Control.If(V.DataTable.JobRecords.RowCount,>,0)
+		'WE have to check if the Job_DETAIL table has a record for each of these transactions
+		F.Intrinsic.Control.For(V.Local.iJobRecordsRow,0,V.DataTable.JobRecords.RowCount--,1)
+			V.Local.dCharge.Set(V.DataTable.JobRecords(V.Local.iJobRecordsRow).Charge_Date!FieldValTrim)
+			
+			'get the largest Suffix for the line
+			F.Intrinsic.String.Build("[Charge_Date] = #{0}# AND [Job] = '{1}' AND [Suffix] = '{2}' AND [Seq] = '{3}'", V.Local.dCharge,V.DataTable.JobRecords(V.Local.iJobRecordsRow).Job!FieldValTrim,V.DataTable.JobRecords(V.Local.iJobRecordsRow).Suffix!FieldValTrim,V.DataTable.JobRecords(V.Local.iJobRecordsRow).Seq!FieldValTrim,V.Local.sFilter)
+			
+			F.Data.DataView.Create("JobRecords","TempPrime", 22, V.Local.sFilter,"Sequence_Key DESC")
+			
+			F.Intrinsic.Control.If(V.DataView.JobRecords!TempPrime.RowCount,>,0)
+				V.Local.sSeqKey.Set(V.DataView.JobRecords!TempPrime(0).Sequence_Key!FieldValTrim)
+				F.Intrinsic.Math.Add(V.Local.sSeqKey.Long,1,V.Local.sSeqKey)
+				F.Intrinsic.String.LPad(V.Local.sSeqKey,"0",4,V.Local.sSeqKey)
+			F.Intrinsic.Control.Else
+				V.Local.sSeqKey.Set("0000")
+			F.Intrinsic.Control.EndIf
+			
+			F.Data.DataView.Close("JobRecords", "TempPrime")
+			
+			F.Intrinsic.String.Build("SELECT * FROM V_Job_Detail WHERE Job = '{0}' AND Suffix = '{1}' ",V.DataTable.JobRecords(V.Local.iJobRecordsRow).Job!FieldValTrim,V.DataTable.JobRecords(V.Local.iJobRecordsRow).Suffix!FieldValTrim, V.Local.sSQL)
+			F.Intrinsic.String.Build("{0} AND Seq = '{1}' AND Charge_Date = '{2}' AND Sequence_Key = '{3}'",V.Local.sSQL,V.DataTable.JobRecords(V.Local.iJobRecordsRow).Seq!FieldValTrim,V.Local.dCharge.PervasiveDate,V.Local.sSeqKey,V.Local.sSQL)
+			F.Data.DataTable.CreateFromSQL("Temp", "Con", V.Local.sSQL)
+	
+			F.Intrinsic.Control.If(V.DataTable.Temp.RowCount,>,0)
+				F.Data.DataTable.SetValue("JobRecords",V.Local.iJobRecordsRow,"Sequence_Key",V.Local.sSeqKey.Trim,"Process_Flag","S")
+			F.Intrinsic.Control.Else
+				F.Data.DataTable.SetValue("JobRecords",V.Local.iJobRecordsRow,"Sequence_Key","-001","Process_Flag","F")
+			F.Intrinsic.Control.EndIf
+			
+			F.Data.DataTable.Close("Temp")
+			
+		F.Intrinsic.Control.Next(V.Local.iJobRecordsRow)
+		
+	F.Intrinsic.Control.Else
+		F.Intrinsic.Control.If(V.DataTable.WIPSuccess.RowCount,=,0,"AND",V.DataTable.WIPFail.RowCount,=,0)
+			'If none of the tables have data, exit program, no report will be created
+			F.Intrinsic.String.Build("{0}\GCG_4414_AutoTransactionsReport.txt", V.Caller.FilesDir, V.Local.sFile)
+			F.Intrinsic.Control.CallSub(RemoveLockFile,"sFileFQN",V.Local.sFile)
+			F.Intrinsic.Control.CallSub(Unload)
+			
+		F.Intrinsic.Control.EndIf
+		
+	F.Intrinsic.Control.EndIf
+	
+	F.Data.DataView.Create("JobRecords", "JobSuccess", 22, "[Process_Flag] = 'S'", "Charge_Date ASC, Job ASC, Suffix ASC")
+	F.Data.DataView.ToDataTable("JobRecords", "JobSuccess", "JobSuccess", True)
+	
+	F.Data.DataView.Create("JobRecords", "JobFail", 22, "[Process_Flag] = 'F'", "Charge_Date ASC, Job ASC, Suffix ASC")
+	F.Data.DataView.ToDataTable("JobRecords", "JobFail", "JobFail", True)
+	
+	F.Data.DataTable.SetValue("JobRecords",-1,"Process_Flag","P")
+	
+	F.Data.DataTable.SaveToDB("JobRecords", "con", "GCG_4414_Job_Imports", "IDKey", 7)
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.String.Build("{0}\GCG_4414_AutoTransactionsReport.txt", V.Caller.FilesDir, V.Local.sFile)
+	F.Intrinsic.Control.CallSub(RemoveLockFile,"sFileFQN",V.Local.sFile)
+	F.Intrinsic.Control.CallSub(CatchError, "Sub", V.Ambient.CurrentSubroutine, "Error", V.Ambient.ErrorNumber, "ErrorDescription", V.Ambient.ErrorDescription)
+F.Intrinsic.Control.EndTry
+Program.Sub.GatherData.End
+
+Program.Sub.CreateReport.Start
+F.Intrinsic.Control.Try
+	V.Local.sFileContent.Declare(String)
+	V.Local.sFileName.Declare(String)
+	V.Local.sFilePath.Declare(String)
+	V.Local.sFile.Declare(String)
+	V.Local.iTableRow.Declare(Long)
+	
+	'Builing the file string.
+	F.Intrinsic.Control.If(V.DataTable.JobSuccess.RowCount,>,0)
+		V.Local.sFileContent.Set("Work Order Record Import Succesful Lines$!$Work Order*!*Suffix*!*Sequence*!*Charge Date$!$")
+		
+		F.Intrinsic.Control.For(V.Local.iTableRow, 0, V.DataTable.JobSuccess.RowCount--, 1)
+			F.Intrinsic.String.Build("{0}{1}*!*{2}*!*", V.Local.sFileContent, V.DataTable.JobSuccess(V.Local.iTableRow).Job!FieldValTrim, V.DataTable.JobSuccess(V.Local.iTableRow).Suffix!FieldValTrim, V.Local.sFileContent)
+			F.Intrinsic.String.Build("{0}{1}*!*{2}$!$", V.Local.sFileContent, V.DataTable.JobSuccess(V.Local.iTableRow).Seq!FieldValTrim, V.DataTable.JobSuccess(V.Local.iTableRow).Charge_Date!FieldValTrim, V.Local.sFileContent)
+		F.Intrinsic.Control.Next(V.Local.iTableRow)
+		
+		F.Intrinsic.String.Build("{0}$!$", V.Local.sFileContent, V.Local.sFileContent)
+		
+	F.Intrinsic.Control.EndIf
+	
+	F.Intrinsic.Control.If(V.DataTable.JobFail.RowCount,>,0)
+		F.Intrinsic.String.Build("{0}Work Order Record Import Failed Lines$!$Work Order*!*Suffix*!*Sequence*!* Charge Date$!$", V.Local.sFileContent, V.Local.sFileContent)
+		
+		F.Intrinsic.Control.For(V.Local.iTableRow, 0, V.DataTable.JobFail.RowCount--, 1)
+			F.Intrinsic.String.Build("{0}{1}*!*{2}*!*", V.Local.sFileContent, V.DataTable.JobFail(V.Local.iTableRow).Job!FieldValTrim, V.DataTable.JobFail(V.Local.iTableRow).Suffix!FieldValTrim, V.Local.sFileContent)
+			F.Intrinsic.String.Build("{0}{1}*!*{2}$!$", V.Local.sFileContent, V.DataTable.JobFail(V.Local.iTableRow).Seq!FieldValTrim, V.DataTable.JobFail(V.Local.iTableRow).Charge_Date!FieldValTrim, V.Local.sFileContent)
+		F.Intrinsic.Control.Next(V.Local.iTableRow)
+		
+		F.Intrinsic.String.Build("{0}$!$", V.Local.sFileContent, V.Local.sFileContent)
+		
+	F.Intrinsic.Control.EndIf
+	
+	F.Intrinsic.Control.If(V.DataTable.WIPSUCCESS.RowCount,>,0)
+		F.Intrinsic.String.Build("{0}WIP to FG Import Successful Lines$!$Work Order*!*Suffix*!*Charge Date$!$", V.Local.sFileContent, V.Local.sFileContent)
+		
+		F.Intrinsic.Control.For(V.Local.iTableRow, 0, V.DataTable.WIPSUCCESS.RowCount--, 1)
+			F.Intrinsic.String.Build("{0}{1}*!*{2}*!*", V.Local.sFileContent, V.DataTable.WIPSUCCESS(v.Local.iTableRow).Job!FieldValTrim, V.DataTable.WIPSUCCESS(V.Local.iTableRow).Suffix!FieldValTrim, V.Local.sFileContent)
+			F.Intrinsic.String.Build("{0}{1}$!$", V.Local.sFileContent, V.DataTable.WIPSUCCESS(v.Local.iTableRow).Charge_Date!FieldValTrim, V.Local.sFileContent)
+		F.Intrinsic.Control.Next(V.Local.iTableRow)
+		
+		F.Intrinsic.String.Build("{0}$!$", V.Local.sFileContent, V.Local.sFileContent)
+		
+	F.Intrinsic.Control.EndIf
+	
+	
+	F.Intrinsic.Control.If(V.DataTable.WIPFAIL.RowCount,>,0)
+		F.Intrinsic.String.Build("{0}WIP to FG Import Failed Lines$!$Work Order*!*Suffix*!*Charge Date*!*Error Message$!$", V.Local.sFileContent, V.Local.sFileContent)
+		
+		F.Intrinsic.Control.For(V.Local.iTableRow, 0, V.DataTable.WIPFAIL.RowCount--, 1)
+			F.Intrinsic.String.Build("{0}{1}*!*{2}*!*", V.Local.sFileContent, V.DataTable.WIPFAIL(v.Local.iTableRow).Job!FieldValTrim, V.DataTable.WIPFAIL(V.Local.iTableRow).Suffix!FieldValTrim, V.Local.sFileContent)
+			F.Intrinsic.String.Build("{0}{1}*!*{2}$!$", V.Local.sFileContent, V.DataTable.WIPFAIL(v.Local.iTableRow).Charge_Date!FieldValTrim, V.DataTable.WIPFAIL(v.Local.iTableRow).Error_Msg!FieldValTrim, V.Local.sFileContent)
+		F.Intrinsic.Control.Next(V.Local.iTableRow)
+		
+	F.Intrinsic.Control.EndIf
+	
+	F.Intrinsic.String.Split(V.Ambient.Now, " ", V.Local.sFileName)
+	F.Intrinsic.String.StripCharacters(V.Local.sFileName(1), V.Local.sFileName(1))
+	F.Intrinsic.String.Replace(V.Local.sFileName, "/", "-", V.Local.sFileName)
+	F.Intrinsic.String.Build("{0}-{1}", V.Local.sFileName(0), V.Local.sFileName(1), V.Local.sFileName)
+	
+	F.Intrinsic.String.Build("{0}\AutomaticJobImport-{1}.xls", V.Caller.FilesDir, V.Local.sFileName, V.Local.sFilePath)
+	
+	F.Automation.MSExcel.WriteSpreadsheet(V.Local.sFilePath, V.Local.sFileContent)
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.String.Build("{0}\GCG_4414_AutoTransactionsReport.txt", V.Caller.FilesDir, V.Local.sFile)
+	F.Intrinsic.Control.CallSub(RemoveLockFile,"sFileFQN",V.Local.sFile)
+	F.Intrinsic.Control.CallSub(CatchError, "Sub", V.Ambient.CurrentSubroutine, "Error", V.Ambient.ErrorNumber, "ErrorDescription", V.Ambient.ErrorDescription)
+F.Intrinsic.Control.EndTry
+Program.Sub.CreateReport.End
+
+Program.Sub.JobRecordsTransactions.Start
+F.Intrinsic.Control.Try
+	V.Local.sRunningFile.Declare(String)
+	V.Local.sSQL.Declare(String)
+	V.Local.sLine.Declare(String)
+	V.Local.sFile.Declare(String)
+	V.Local.sNow.Declare(String)
+	V.Local.sBackUp.Declare(String)
+	V.Local.sChargeDate.Declare(String)
+	V.Local.iJobsRow.Declare(Long)
+	
+	F.Data.DataTable.CreateFromSQL("Jobs", "con", "SELECT * FROM GCG_4414_Job_Imports WHERE Process_Flag = 'N'", True)
+	F.Data.DataTable.AddExpressionColumn("Jobs", "GoodPieceFormat", "Float", "[Pieces_Good]*10000")
+	F.Data.DataTable.AddExpressionColumn("Jobs", "ScrapPieceFormat", "Float", "[Pieces_Scrap]*10000")
+	F.Data.DataTable.AddExpressionColumn("Jobs", "HoursFormat", "Float", "[Hours]*10000")
+	
+	'The file created for the upload is a tab delimited file
+	F.Intrinsic.Control.For(V.Local.iJobsRow,0,V.DataTable.Jobs.RowCount--,1)
+	
+		F.Intrinsic.String.Format(V.DataTable.Jobs(V.Local.iJobsRow).Charge_Date!FieldValTrim, "MMDDYY", V.Local.sChargeDate)
+		'Parameters are: date, Employee, Job, Suffix, Seq, workcenter, hours, closed, indirect, start time, finish time, rate type, good pieces, scrap pieces, scrap code
+		
+		F.Intrinsic.String.Build("{1}{2}{0}{3}{0}{4}{0}",V.Ambient.Tab,V.Local.sLine,V.Local.sChargeDate,V.DataTable.Jobs(V.Local.iJobsRow).Employee!FieldValTrim,V.DataTable.Jobs(V.Local.iJobsRow).Job!FieldValTrim,V.Local.sLine)
+		F.Intrinsic.String.Build("{1}{2}{0}{3}{0}{4}{0}",V.Ambient.Tab,V.Local.sLine,V.DataTable.Jobs(V.Local.iJobsRow).Suffix!FieldValTrim,V.DataTable.Jobs(V.Local.iJobsRow).Seq!FieldValTrim, V.DataTable.Jobs(V.Local.iJobsRow).Workcenter.FieldValTrim,V.Local.sLine)
+		F.Intrinsic.String.Build("{1}{2}{0}N{0}D{0}{0}{0}R{0}",V.Ambient.Tab,V.Local.sLine,V.DataTable.Jobs(V.Local.iJobsRow).Hours!FieldValTrim,V.Local.sLine)
+		F.Intrinsic.String.Build("{1}{2}{0}{3}{0}0{0}{4}",V.Ambient.Tab,V.Local.sLine,V.DataTable.Jobs(V.Local.iJobsRow).GoodPieceFormat!FieldValTrim, V.DataTable.Jobs(V.Local.iJobsRow).ScrapPieceFormat!FieldValTrim,V.Ambient.NewLine,V.Local.sLine)
+		
+		F.Intrinsic.String.Build("UPDATE GCG_4414_Job_Imports SET Process_Flag = 'B' WHERE IDKey = '{0}'",V.DataTable.Jobs(V.Local.iJobsRow).IDKey!FieldValTrim,V.Local.sSQL)
+		F.ODBC.Connection!con.Execute(V.Local.sSQL)
+		
+	F.Intrinsic.Control.Next(V.Local.iJobsRow)
+	
+	V.Local.sNow.Set(V.Ambient.Date)
+	F.Intrinsic.String.Replace(v.Local.sNow, "/", "", V.Local.sNow)
+	F.Intrinsic.String.Replace(V.Local.sNow, " ", "", V.Local.sNow)
+	F.Intrinsic.String.Replace(V.Local.sNow, ":", "", V.Local.sNow)
+	
+	F.Intrinsic.Control.If(V.Local.sLine.Trim,<>,"")
+	    F.Intrinsic.String.Build("{0}\{1}{2}MOPEN.txt",V.Caller.FilesDir,V.Caller.CompanyCode,V.Caller.Terminal,V.Local.sFile)
+	    F.Intrinsic.File.String2File(V.Local.sFile,V.Local.sLine)
+	    
+	    F.Intrinsic.String.Build("{0}\LABOR-{1}{2}{3}.Bkp",V.Caller.FilesDir,V.Caller.CompanyCode,V.Caller.Terminal,V.Local.sNow,V.Local.sBackup)
+	    F.Intrinsic.File.String2File(V.Local.sBackup,V.Local.sLine)
+	    
+	    F.Intrinsic.String.Build("{0}{1}MOPEN.txt",V.Caller.CompanyCode,V.Caller.Terminal,V.Local.sFile)
+	
+	    F.Intrinsic.Task.LaunchGSSSync("JB0455","-C",V.Local.sFile)
+	    
+	F.Intrinsic.Control.EndIf
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.String.Build("{0}\GCG_4414_AutoTransactions.txt", V.Caller.FilesDir, V.Local.sRunningFile)
+	F.Intrinsic.Control.CallSub(RemoveLockFile,"sFileFQN",V.Local.sRunningFile)
+	F.Intrinsic.Control.CallSub(CatchError, "Sub", V.Ambient.CurrentSubroutine, "Error", V.Ambient.ErrorNumber, "ErrorDescription", V.Ambient.ErrorDescription)
+F.Intrinsic.Control.EndTry
+Program.Sub.JobRecordsTransactions.End
+
+Program.Sub.Backflush.Start
+F.Intrinsic.Control.Try
+	V.Local.sFile.Declare(String)
+	V.Local.sJob.Declare(String)
+	V.Local.sSuffix.Declare(String)
+	V.Local.sIDKey.Declare(String)
+	V.Local.sSQL.Declare(String)
+	V.Local.sRet.Declare(String)
+	V.Local.sParams.Declare(String)
+	V.Local.sPart.Declare(String)
+	V.Local.sRev.Declare(String)
+	V.Local.sFileName.Declare(String)
+	V.Local.sFileData.Declare(String)
+	V.Local.sLoc.Declare(String)
+	V.Local.sQty.Declare(String)
+	V.Local.sBin.Declare(String)
+	V.Local.sTemp.Declare(String)
+	V.Local.sEndSeq.Declare(String)
+	V.Local.sOperation.Declare(String)
+	V.Local.sFlag.Declare(String)
+	V.Local.sPartRev.Declare(String)
+	V.Local.sDefaultBin.Declare(String)
+	V.Local.sStartSeq.Declare(String)
+	V.Local.iBackflushRow.Declare(Long)
+	V.Local.iMatlTempRow.Declare(Long)
+	V.Local.iIssueAuditRow.Declare(Long)
+	V.Local.iBIRunID.Declare(Long)
+	V.Local.fTotalPieces.Declare(Float)
+	V.Local.fQty.Declare(Float)
+	
+	F.Global.BI.GetRunID(V.Local.iBIRunID)
+	
+	'This table is for Issuing material to work orders flagged as Backflushing orders
+	F.Intrinsic.String.Split("Part*!*Rev*!*Locn*!*Qty*!*Lot*!*Bin*!*Heat*!*Serial*!*WO*!*Suff*!*Seq!*!String*!*String*!*String*!*String*!*String*!*String*!*String*!*String*!*String*!*String*!*String", "!*!", V.Local.sRet)
+	F.Data.DataTable.CreateFromString("IssueTemp", "", V.Local.sRet(0), V.Local.sRet(1), "*!*", "!*!")
+	
+	'We create a table to store instances where the material issued to a work order did not all come from the intended bin
+	F.Data.DataTable.CreateFromSQL("IssueAuditTable", "con", "SELECT * FROM GCG_4414_Issue_Audit")
+	F.Data.DataTable.DeleteRow("IssueAuditTable")
+	F.Data.DataTable.AcceptChanges("IssueAuditTable")
+	
+	F.Data.DataTable.CreateFromSQL("Backflush","con","SELECT Job, Suffix, IDKey, Seq, (Pieces_Scrap + Pieces_Good) AS TotalPieces FROM GCG_4414_Job_Imports WHERE Process_Flag = 'B'")
+	
+	F.Intrinsic.Control.For(V.Local.iBackflushRow,0,V.DataTable.Backflush.RowCount--,1)
+		V.Local.sJob.Set(V.DataTable.Backflush(V.Local.iBackflushRow).Job!FieldValString)
+		V.Local.sSuffix.Set(V.DataTable.Backflush(V.Local.iBackflushRow).Suffix!FieldValString)
+		V.Local.sIDKey.Set(V.DataTable.Backflush(V.Local.iBackflushRow).IDKey!FieldValString)
+		V.Local.sEndSeq.Set(V.DataTable.Backflush(V.Local.iBackflushRow).Seq!FieldValString)
+		V.Local.fTotalPieces.Set(V.DataTable.Backflush(V.Local.iBackflushRow).TotalPieces!FieldValFloat)
+		
+		F.Data.DataTable.DeleteRow("IssueTemp")
+		
+		'We will be "backflushing" the material for the work order if work order is labeled as a backflush work order.
+		F.Intrinsic.String.Build("SELECT TOP 1 Operation FROM V_Job_Operations WHERE Job = '{0}' AND Suffix = '{1}' AND Seq = '{2}' AND LMO = 'L' AND Operation = 'BCKFLS'", V.Local.sJob, V.Local.sSuffix, V.Local.sEndSeq, V.Local.sSQL)
+		F.ODBC.Connection!con.ExecuteAndReturn(V.Local.sSQL, V.Local.sOperation)
+		
+		'*************************
+		'Modification by FEQ 04/18/2018
+		'Customer wants to change the way we issue material. we will be looking at the labor Sequences with Operation as "BCKFLS" from the V_Job_Operations table. We check the material Sequences before, and if they are closed, we do not attempt to issue.
+		'We will continue until we come to the first instance of a material Sequence that is not closed. We will issue material for those Sequences that are between the labor Sequences.
+		'From a technical pov, we just need to change the information of the MatlTemp table to limit to the material Sequences between the labor Sequences.
+		
+		F.Intrinsic.Control.If(V.Local.sOperation,<>,"")
+			F.Intrinsic.String.Build("SELECT TOP 1 Seq FROM V_Job_Operations WHERE Job = '{0}' AND Suffix = '{1}' AND Seq < '{2}' AND LMO = 'L' AND Operation = 'BCKFLS' ORDER BY Seq DESC", V.Local.sJob, V.Local.sSuffix, V.Local.sEndSeq, V.Local.sSQL)
+			F.ODBC.Connection!con.ExecuteAndReturn(V.Local.sSQL, V.Local.sStartSeq)
+			
+			F.Intrinsic.Control.If(V.Local.sStartSeq.Trim,=,"")
+				V.Local.sStartSeq.Set("000000")
+			F.Intrinsic.Control.EndIf
+			
+		F.Intrinsic.Control.Else
+			'If no backflush operation is found for the specific row we mark the row as processed and continue to the next row
+			F.Intrinsic.String.Build("UPDATE GCG_4414_Job_Imports SET Process_Flag = 'W' WHERE IDKey = '{0}'",V.Local.sIDKey,V.Local.sSQL)
+			F.ODBC.Connection!con.Execute(V.Local.sSQL)
+			
+			F.Intrinsic.Control.Next(V.Local.iBackflushRow)
+		F.Intrinsic.Control.EndIf
+		
+		F.Intrinsic.String.Build("SELECT TOP 1 Location FROM V_Job_Header WHERE Job = '{0}' AND Suffix = '{1}'", V.Local.sJob, V.Local.sSuffix, V.Local.sSQL)
+		F.ODBC.Connection!con.ExecuteAndReturn(V.Local.sSQL, V.Local.sLoc)
+		
+		F.Intrinsic.String.Build("SELECT Part, Locn, Seq, Hours_Estimated - Hours_Actual AS Qty, Units FROM V_Job_Operations WHERE Job = '{0}' AND Suffix = '{1}' AND LMO = 'M' AND Seq BETWEEN '{2}' AND '{3}'", V.Local.sJob, V.Local.sSuffix, V.Local.sStartSeq, V.Local.sEndSeq, V.Local.sSQL)
+		F.Data.DataTable.CreateFromSQL("MatlTemp", "con", V.Local.sSQL)
+		
+		F.Intrinsic.Control.For(V.Local.iMatlTempRow,0,V.DataTable.MatlTemp.RowCount--,1)
+			F.Intrinsic.Control.If(V.DataTable.MatlTemp(V.Local.iMatlTempRow).QTY!FieldValFloat, >, 0)
+				F.Intrinsic.String.RPad(V.DataTable.MatlTemp(V.Local.iMatlTempRow).Part!FieldValTrim, " ", 20, V.Local.sPartRev)
+				
+				'Units field tells us how many pieces are required to make a single part, thus we multiply the total.
+				F.Intrinsic.Math.Mult(V.Local.fTotalPieces, V.DataTable.MatlTemp(V.Local.iMatlTempRow).Units!FieldValFloat,V.Local.fQty)
+				
+				V.Local.sQty.Set(V.Local.fQty)
+				F.Intrinsic.String.Split(V.Local.sQty, ".", V.Local.sQty)
+				V.Local.sQty.RedimPreserve(0,1)
+				F.Intrinsic.String.RPad(V.Local.sQty(1), "0", 4, V.Local.sQty(1))
+				F.Intrinsic.String.Join(V.Local.sQty, ".", V.Local.sQty)
+				
+				F.Intrinsic.String.Right(V.Local.sPartRev, 3, V.Local.sRev)
+				F.Intrinsic.String.Left(V.Local.sPartRev, 17, V.Local.sPart)
+				
+				'Customer flags certain material as 'do not flush' in Inventory master Options and expected the code to automatically refrain from issuing material on those flagged parts...
+				F.Intrinsic.String.Build("SELECT Top 1 Do_Not_Backflush FROM V_Inventory_MST3 WHERE Part = '{0}' AND Location = '{1}'",V.DataTable.MatlTemp(V.Local.iMatlTempRow).Part!FieldValTrim,V.Local.sLoc,V.Local.sSQL)
+				F.ODBC.Connection!con.ExecuteAndReturn(V.Local.sSQL, V.Local.sFlag)
+				
+				F.Intrinsic.Control.If(V.Local.sFlag.Trim,<>,"Y")
+					F.Intrinsic.String.Build("SELECT TOP 1 Bin FROM V_Inventory_Mstr WHERE Part = '{0}' AND Location = '{1}'", V.DataTable.MatlTemp(V.Local.iMatlTempRow).Part!FieldValTrim, V.Local.sLoc, V.Local.sSQL)
+					F.ODBC.Connection!con.ExecuteAndReturn(V.Local.sSQL, V.Local.sBin)
+					
+					F.Intrinsic.Control.If(V.Local.sBin,<>,"")
+						F.Intrinsic.String.Build("SELECT TOP 1 Quantity, Lot, Bin, Heat, Serial_Number FROM V_Item_Master WHERE Part = '{0}' AND Location = '{1}' AND Bin = '{2}'", V.DataTable.MatlTemp(V.Local.iMatlTempRow).Part!FieldValTrim, V.Local.sLoc, V.Local.sBin.Trim, V.Local.sSQL)
+						F.ODBC.Connection!con.ExecuteAndReturn(V.Local.sSQL, V.Local.sRet)
+						
+						F.Intrinsic.Control.If(V.Local.sRet.Trim,<>,"")
+							F.Intrinsic.String.Split(V.Local.sRet, "*!*", V.Local.sRet)
+							
+							'If there is enough material in the default bin for the part, pull them all from there
+							F.Intrinsic.Control.If(V.Local.sRet(0).Float,>=,V.Local.sQty.Float)
+								F.Data.DataTable.AddRow("IssueTemp","Part",V.Local.sPart,"Rev",V.Local.sRev,"Locn",V.Local.sLoc,"Qty",V.Local.sQty,"Lot",V.Local.sRet(1),"Bin",V.Local.sRet(2),"Heat",V.Local.sRet(3),"Serial",V.Local.sRet(4),"WO", V.Local.sJob,"Suff",V.Local.sSuffix,"Seq",V.DataTable.MatlTemp(V.Local.iMatlTempRow).Seq!FieldValTrim)
+							
+							'Otherwise pull as many as available in there. We will need to record these instances for the Audit Trail.
+							F.Intrinsic.Control.Else
+								F.Intrinsic.String.Split(V.Local.sRet(0), ".", V.Local.sTemp)
+								V.Local.sTemp.RedimPreserve(0,1)
+								F.Intrinsic.String.RPad(V.Local.sTemp(1), "0", 4, V.Local.sTemp(1))
+								F.Intrinsic.String.Join(V.Local.sTemp, ".", V.Local.sTemp)
+								
+								F.Data.DataTable.AddRow("IssueTemp","Part",V.Local.sPart,"Rev",V.Local.sRev,"Locn", V.Local.sLoc,"Qty",V.Local.sTemp,"Lot",V.Local.sRet(1),"Bin",V.Local.sRet(2),"Heat",V.Local.sRet(3),"Serial",V.Local.sRet(4),"WO",V.Local.sJob,"Suff",V.Local.sSuffix,"Seq",V.DataTable.MatlTemp(V.Local.iMatlTempRow).Seq!FieldValTrim)
+								
+								V.Local.sDefaultBin.Set(V.Local.sRet(2))
+								'We get the stocking bin information to report to the audit
+								F.Intrinsic.String.Build("SELECT TOP 1 Stock_Bin FROM V_Inventory_Mst3 WHERE Part = '{0}' AND Location = '{1}'", V.DataTable.MatlTemp(V.Local.iMatlTempRow).Part!FieldValTrim, V.Local.sLoc, V.Local.sSQL)
+								F.ODBC.Connection!con.ExecuteAndReturn(V.Local.sSQL, V.Local.sBin)
+								
+								F.Intrinsic.Control.If(V.Local.sBin, <>, "")
+									F.Intrinsic.String.Build("SELECT TOP 1 Quantity FROM V_Item_Master WHERE Part = '{0}' AND Location = '{1}' AND Bin = '{2}'", V.DataTable.MatlTemp(V.Local.iMatlTempRow).Part!FieldValTrim, V.Local.sLoc, V.Local.sBin, V.Local.sSQL)
+									F.ODBC.Connection!con.ExecuteAndReturn(V.Local.sSQL, V.Local.sRet)
+									
+								F.Intrinsic.Control.Else
+									V.Local.sBin.Set("No Default Bin Found")
+								F.Intrinsic.Control.EndIf
+								
+								'Audit trail entry
+								F.Data.DataTable.AddRow("IssueAuditTable", "BIRunID", V.Local.iBIRunID, "Material", V.Local.sPartRev, "Qty_Needed", V.Local.sQty, "Default_Bin", V.Local.sDefaultBin, "Qty_DefaultBin", V.Local.sTemp.Float, "Alt_Bin", V.Local.sBin, "Qty_AltBin", V.Local.sRet.Float)
+								
+							F.Intrinsic.Control.EndIf
+							
+						F.Intrinsic.Control.EndIf
+						
+					F.Intrinsic.Control.EndIf
+					
+				F.Intrinsic.Control.EndIf
+				
+			F.Intrinsic.Control.EndIf
+			
+		F.Intrinsic.Control.Next(V.Local.iMatlTempRow)
+		
+		F.Data.DataTable.Close("MatlTemp")
+		
+		F.Intrinsic.Control.If(V.DataTable.IssueTemp.RowCount,>,0)
+			F.Data.DataView.Create("IssueTemp", "IssueView", 22)
+			F.Data.DataView.ToString("IssueTemp", "IssueView", ",", V.Ambient.NewLine, V.Local.sFileData)
+			F.Data.DataView.Close("IssueTemp", "IssueView")
+			
+			F.Intrinsic.String.Build("{0}\L{1}{2}MOPEN.txt",V.Caller.FilesDir,v.Caller.CompanyCode,V.Caller.Terminal,V.Local.sFileName)
+			F.Intrinsic.File.String2File(V.Local.sFileName, V.Local.sFileData)
+			
+			F.Intrinsic.String.Build("L{0}{1}MOPEN.txt", V.Caller.CompanyCode,V.Caller.Terminal, V.Local.sFileName)
+			F.Intrinsic.String.Build("{0}!*!{1}!*!NS", V.Local.sFileName, V.Local.sFileData, V.Local.sParams)
+			F.Global.General.CallWrapperSync(450100, V.Local.sParams)
+			
+		F.Intrinsic.Control.EndIf
+		
+		F.Intrinsic.String.Build("UPDATE GCG_4414_Job_Imports SET Process_Flag = 'W' WHERE IDKey = '{0}'",V.Local.sIDKey,V.Local.sSQL)
+		F.ODBC.Connection!con.Execute(V.Local.sSQL)
+		
+	F.Intrinsic.Control.Next(V.Local.iBackflushRow)
+	
+	F.Intrinsic.Control.If(V.DataTable.IssueAuditTable.RowCount,>,0)
+		'We will print the audit trail for the customer to view
+		F.Intrinsic.Control.For(V.Local.iIssueAuditRow,0,V.DataTable.IssueAuditTable.RowCount--,1)
+			F.Intrinsic.String.Build("INSERT INTO GCG_4414_Issue_Audit (BIRunID, Material, Qty_Needed, Default_Bin, Qty_DefaultBin, Alt_Bin, Qty_AltBin) Values ('{0}', '{1}', '{2}', '{3}', '{4}', '{5}', '{6}')",V.DataTable.IssueAuditTable(V.Local.iIssueAuditRow).BIRunID!FieldValLong,V.DataTable.IssueAuditTable(V.Local.iIssueAuditRow).Material!FieldValTrim,V.DataTable.IssueAuditTable(V.Local.iIssueAuditRow).Qty_Needed!FieldValFloat,V.DataTable.IssueAuditTable(V.Local.iIssueAuditRow).Default_Bin!FieldValTrim,V.DataTable.IssueAuditTable(V.Local.iIssueAuditRow).Qty_DefaultBin!FieldValFloat,V.DataTable.IssueAuditTable(V.Local.iIssueAuditRow).Alt_Bin!FieldValTrim,V.DataTable.IssueAuditTable(V.Local.iIssueAuditRow).Qty_AltBin!FieldValTrim,V.Local.sSQL)
+			F.ODBC.Connection!con.Execute(V.Local.sSQL)
+		F.Intrinsic.Control.Next(V.Local.iIssueAuditRow)
+	F.Intrinsic.Control.EndIf
+	
+	F.Data.DataTable.Close("IssueAuditTable")
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.String.Build("{0}\GCG_4414_AutoTransactions.txt", V.Caller.FilesDir, V.Local.sFile)
+	F.Intrinsic.Control.CallSub(RemoveLockFile,"sFileFQN",V.Local.sFile)
+	F.Intrinsic.Control.CallSub(CatchError, "Sub", V.Ambient.CurrentSubroutine, "Error", V.Ambient.ErrorNumber, "ErrorDescription", V.Ambient.ErrorDescription)
+F.Intrinsic.Control.EndTry
+Program.Sub.Backflush.End
+
+Program.Sub.WIPtoFGTransactions.Start
+F.Intrinsic.Control.Try
+	V.Local.sFile.Declare(String)
+	V.Local.sParams.Declare(String)
+	V.Local.sSQL.Declare(String)
+	V.Local.sYR.Declare(String)
+	V.Local.sMO.Declare(String)
+	V.Local.sDY.Declare(String)
+	V.Local.sRet.Declare(String)
+	V.Local.sErr.Declare(String)
+	V.Local.iWIPFGRow.Declare(Long)
+	V.Local.dCharge.Declare(Date)
+	
+	'ClosingWO sub uses WIPFG table so we declare it as Global
+	F.Data.DataTable.CreateFromSQL("WIPFG", "con", "SELECT * FROM GCG_4414_WIPFG_IMP WHERE Process_Flag = 'N'",True)
+	
+	F.Intrinsic.Control.For(V.Local.iWIPFGRow,0,V.DataTable.WIPFG.RowCount--,1)
+		V.Local.dCharge.Set(V.DataTable.WIPFG(V.Local.iWIPFGRow).Charge_Date!FieldValTrim)
+		F.Intrinsic.Date.Year(V.Local.dCharge,V.Local.sYR)
+		F.Intrinsic.Date.Month(V.Local.dCharge, V.Local.sMO)
+		F.Intrinsic.Date.Day(V.Local.dCharge, V.Local.sDY)
+		
+		F.Intrinsic.Control.CallSub(GetWorkOrderCloseStatus,"Job",V.DataTable.WIPFG(V.Local.iWIPFGRow).Job!FieldVal,"Suffix",V.DataTable.WIPFG(V.Local.iWIPFGRow).Suffix!FieldVal,"Qty",V.DataTable.WIPFG(V.Local.iWIPFGRow).Quantity!FieldValFloat)
+		
+		'Callwrapper Parameters, delimited by *!*, Company, Terminal, Calling program, Mode, Pass dtl Job, Pass tl Suffix, Pass Dtl Seq, PD Fill, PD Date, PD Key Seq, Work Order, WO Suffix, Transfer Yr, Transfer Mo, Transfer Dy, Close WO Flag, Part Desc, Quantity, Cost, Price, Print Label Flag, Cost Method, Update Inv flag, Inventory Debit Acct, Filename
+		F.Intrinsic.String.ConcatCallWrapperArgs(V.Caller.CompanyCode,V.Caller.Terminal,"","NS","","","","","","",V.DataTable.WIPFG(V.Local.iWIPFGRow).Job!FieldVal,V.DataTable.WIPFG(V.Local.iWIPFGRow).Suffix!FieldVal,V.Local.sYR,V.Local.sMO,V.Local.sDY,V.Args.CloseStatus,V.DataTable.WIPFG(V.Local.iWIPFGRow).Part_Desc!FieldVal,V.DataTable.WIPFG(V.Local.iWIPFGRow).Quantity!FieldValFloat,"1.000","1.000","N","","Y","","",V.Local.sParams)
+		F.Global.General.CallWrapperSync("2003", V.Local.sParams)
+		
+		'Retrieve the return status from the callwrapper
+		F.Intrinsic.String.Split(V.Ambient.CallWrapperReturn, "RETURN::", V.Local.sRet)
+		F.Intrinsic.String.Left(V.Local.sRet(1), 1, V.Local.sRet(0))
+		F.Intrinsic.String.Split(V.Local.sRet(1), "ERROR-MESSAGE::", V.Local.sErr)
+		F.Intrinsic.String.Split(V.Local.sErr(1), "*!*", V.Local.sErr)
+		
+		F.Intrinsic.Control.If(V.Local.sRet(0),=,"0")
+			'The process was successful
+			F.Intrinsic.String.Build("Update GCG_4414_WIPFG_IMP Set Process_Flag = 'S' WHERE IDKey = '{0}' ", V.DataTable.WIPFG(V.Local.iWIPFGRow).IDKey!FieldValLong, V.Local.sSQL)
+			F.Data.DataTable.SetValue("WIPFG", V.Local.iWIPFGRow, "Process_Flag", "S")
+		F.Intrinsic.Control.Else
+			'The process was unsuccessful
+			F.Intrinsic.String.Build("UPDATE GCG_4414_WIPFG_IMP Set Process_Flag = 'F', Error_Msg = '{1}' WHERE IDKey = '{0}' ", V.DataTable.WIPFG(V.Local.iWIPFGRow).IDKey!FieldValLong, V.Local.sErr(0), V.Local.sSQL)
+			F.Data.DataTable.SetValue("WIPFG", V.Local.iWIPFGRow, "Process_Flag", "F")
+		F.Intrinsic.Control.EndIf
+		
+		F.ODBC.Connection!con.Execute(V.Local.sSQL)
+	F.Intrinsic.Control.Next(V.Local.iWIPFGRow)
+	
+	F.Data.Datatable.Close("WIPFG")
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.String.Build("{0}\GCG_4414_AutoTransactions.txt", V.Caller.FilesDir, V.Local.sFile)
+	F.Intrinsic.Control.CallSub(RemoveLockFile,"sFileFQN",V.Local.sFile)
+	F.Intrinsic.Control.CallSub(CatchError, "Sub", V.Ambient.CurrentSubroutine, "Error", V.Ambient.ErrorNumber, "ErrorDescription", V.Ambient.ErrorDescription)
+F.Intrinsic.Control.EndTry
+Program.Sub.WIPtoFGTransactions.End
+
+'Checks whether a work order should be closed or not based off of the current qty_completed, the amount to add to qty_completed, and the qty_order form the job header
+Program.Sub.GetWorkOrderCloseStatus.Start
+F.Intrinsic.Control.Try
+	V.Local.sSQL.Declare(String)
+	V.Local.fTotalQuantity.Declare(String)
+	
+	F.Intrinsic.String.Build("SELECT TOP 1 Qty_Order, Qty_Completed FROM V_Job_Header WHERE Job = '{0}' AND Suffix = '{1}'",V.Args.Job,V.Args.Suffix,V.Local.sSQL)
+	
+	F.Data.DataTable.CreateFromSQL("WOCloseStatus","con",V.Local.sSQL)
+	
+	'If no data is found we return N
+	F.Intrinsic.Control.If(V.DataTable.WOCloseStatus.RowCount,=,0)
+		F.Intrinsic.Variable.AddRV("CloseStatus","N")
+		F.Data.DataTable.Close("WOCloseStatus")
+		F.Intrinsic.Control.ExitSub
+	F.Intrinsic.Control.EndIf
+	
+	F.Intrinsic.Math.Add(V.DataTable.WOCloseStatus(0).Qty_Completed!FieldValFloat,V.Args.Qty,V.Local.fTotalQuantity)
+	
+	F.Intrinsic.Control.If(V.Local.fTotalQuantity,>=,V.DataTable.WOCloseStatus(0).Qty_Order!FieldValFloat)
+		F.Intrinsic.Variable.AddRV("CloseStatus","Y")
+	F.Intrinsic.Control.Else
+		F.Intrinsic.Variable.AddRV("CloseStatus","N")
+	F.Intrinsic.Control.EndIf
+	
+	F.Data.DataTable.Close("WOCloseStatus")
+	
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.CallSub(CatchError, "Sub", V.Ambient.CurrentSubroutine, "Error", V.Ambient.ErrorNumber, "ErrorDescription", V.Ambient.ErrorDescription)
+F.Intrinsic.Control.EndTry
+Program.Sub.GetWorkOrderCloseStatus.End
+
+'Attempts to get a write lock on the lock file. If not successful the application will close
+Program.Sub.PerformLockCheck.Start
+F.Intrinsic.Control.Try
+	V.Local.bFileEixsts.Declare(Boolean)
+	V.Local.bLocked.Declare(Boolean)
+	
+	F.Intrinsic.File.Exists(V.Args.sFileFQN,V.Local.bFileEixsts)
+	F.Intrinsic.Control.If(V.Local.bFileEixsts)
+		
+		F.Intrinsic.File.IsFileLocked(V.Args.sFileFQN,V.Local.bLocked)
+		
+		F.Intrinsic.Control.If(V.Local.bLocked)
+			F.Intrinsic.Control.CallSub(Unload)
+		F.Intrinsic.Control.Else		
+			F.Intrinsic.File.GetHandle(V.Global.iFileHandle)
+			F.Intrinsic.File.OpenForWrite(V.Args.sFileFQN,V.Global.iFileHandle)
+			
+		F.Intrinsic.Control.EndIf		
+		
+	F.Intrinsic.Control.Else
+		F.Intrinsic.File.GetHandle(V.Global.iFileHandle)
+		F.Intrinsic.File.OpenForWrite(V.Args.sFileFQN,V.Global.iFileHandle)
+		F.Intrinsic.File.WriteLine(V.Global.iFileHandle,V.Args.sMessage)
+	F.Intrinsic.Control.EndIf
+	
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.CallSub(CatchError, "Sub", V.Ambient.CurrentSubroutine, "Error", V.Ambient.ErrorNumber, "ErrorDescription", V.Ambient.ErrorDescription)
+F.Intrinsic.Control.EndTry
+Program.Sub.PerformLockCheck.End
+
+'Closes the write lock on the lock file and then deletes it
+Program.Sub.RemoveLockFile.Start
+F.Intrinsic.Control.Try
+	V.Local.bFileExists.Declare(Boolean)
+	
+	F.Intrinsic.File.Exists(V.Args.sFileFQN,V.Local.bFileExists)
+	
+	F.Intrinsic.Control.If(V.Local.bFileExists)
+		F.Intrinsic.File.CloseFile(V.Global.iFileHandle)
+		F.Intrinsic.File.DeleteFile(V.Args.sFileFQN)
+	F.Intrinsic.Control.EndIf
+	
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.CallSub(CatchError, "Sub", V.Ambient.CurrentSubroutine, "Error", V.Ambient.ErrorNumber, "ErrorDescription", V.Ambient.ErrorDescription)
+F.Intrinsic.Control.EndTry
+Program.Sub.RemoveLockFile.End
+
+Program.Sub.Unload.Start
+F.Intrinsic.Control.Try
+
+	F.ODBC.Connection!con.Close
+	F.Intrinsic.Control.End
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.CallSub(CatchError, "Sub", V.Ambient.CurrentSubroutine, "Error", V.Ambient.ErrorNumber, "ErrorDescription", V.Ambient.ErrorDescription)
+F.Intrinsic.Control.EndTry
+Program.Sub.Unload.End
+
+Program.Sub.CatchError.Start
+F.Intrinsic.Control.Try
+	V.Local.sErrorMessage.Declare(String)
+	
+	F.Intrinsic.String.Build("Program: GCG_4414_AutoJobTransactions.g2u{0}{0}Sub: {1}{0}Error: {2}{0}Error Description: {3}",V.Ambient.NewLine,V.Args.Sub,V.Args.Error,V.Args.ErrorDescription,V.Local.sErrorMessage)
+	F.Intrinsic.UI.Msgbox(V.Local.sErrorMessage,"Unhandled Error Occurred")
+	
+	F.Intrinsic.Control.If(V.Args.Sub.UCase,!=,"unload")
+		F.Intrinsic.Control.CallSub(Unload)
+	F.Intrinsic.Control.Else
+		F.Intrinsic.Control.End
+	F.Intrinsic.Control.EndIf
+	
+F.Intrinsic.Control.Catch
+	F.Intrinsic.UI.Msgbox("Fatal Error occurred in program GCG_4414_AutoJobTransactions.g2u","Unhandled Error Occurred")
+	F.Intrinsic.Control.End
+F.Intrinsic.Control.EndTry
+Program.Sub.CatchError.End
+
+Program.Sub.Comments.Start
+${$0$}$Automate Job Transactions$}$FEQ$}$4/18/2017 12:35:48 PM$}$False
+${$3$}$0$}$$}$0$}$-1$}$$}$12:00:00 AM$}$This program was created by FEQ on 4/18/2017 for Lexington Manufacturing.
+
+The program will run off a custom menu item. It will read from two different custom tables, GCG_4414_Job_IMPORTS and GCG_4144_WIPFG_IMP, and upload the information into Global Shop
+Program.Sub.Comments.End
